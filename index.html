@@ -7,9 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Anton&family=Barlow:wght@400;500;600;700;800;900&family=Barlow+Condensed:wght@700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script type="module">
-// ── Firebase SDK (loaded as module, exposes to window) ────────
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, getDocs }
+import { getFirestore, doc, setDoc, onSnapshot }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -21,20 +20,12 @@ const firebaseConfig = {
   appId: "1:758077678238:web:188b5498d2f791d6ebd18f"
 };
 
-const fbApp = initializeApp(firebaseConfig);
-const db    = getFirestore(fbApp);
-
-// Expose to global scope so the main script can use them
-window._db         = db;
-window._doc        = doc;
-window._setDoc     = setDoc;
-window._getDoc     = getDoc;
+const _app = initializeApp(firebaseConfig);
+window._db        = getFirestore(_app);
+window._doc       = doc;
+window._setDoc    = setDoc;
 window._onSnapshot = onSnapshot;
-window._collection = collection;
-window._getDocs    = getDocs;
-window._fbReady    = true;
-
-// Notify main script that Firebase is ready
+window._fbReady   = true;
 document.dispatchEvent(new Event('firebase-ready'));
 </script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -294,7 +285,6 @@ canvas{max-height:200px}
       <div>
         <div class="top-title" id="topTitle">Dashboard</div>
         <div class="top-sub" id="topSub">Relatório Mensal</div>
-        <div id="syncIndicator" style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;display:none">⟳ sincronizando...</div>
       </div>
       <div class="top-actions">
         <select class="month-sel" id="monthSel" onchange="onMonthChange(this.value)">
@@ -391,7 +381,36 @@ canvas{max-height:200px}
   <div class="modal">
     <div class="modal-title">Nova Meta Mensal</div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:16px">Meta de faturamento por cliente</div>
-    <div st
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="form-row" style="grid-column:1/-1">
+        <div class="form-label">Cliente</div>
+        <select class="form-select" id="mm_c"></select>
+      </div>
+      <div class="form-row">
+        <div class="form-label">Mês</div>
+        <select class="form-select" id="mm_m">
+          <option>Janeiro</option><option>Fevereiro</option><option>Março</option>
+          <option>Abril</option><option>Maio</option><option>Junho</option>
+          <option>Julho</option><option>Agosto</option><option>Setembro</option>
+          <option>Outubro</option><option>Novembro</option><option>Dezembro</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <div class="form-label">Ano</div>
+        <input class="form-inp" id="mm_a" value="2026" placeholder="2026">
+      </div>
+      <div class="form-row" style="grid-column:1/-1">
+        <div class="form-label">Meta de Faturamento (R$)</div>
+        <input class="form-inp" id="mm_v" placeholder="150000">
+      </div>
+    </div>
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeMetaModal()">Cancelar</button>
+      <button class="btn btn-primary" onclick="saveMeta()">Salvar</button>
+    </div>
+  </div>
+</div>
+
 <script>
 
 
@@ -432,76 +451,56 @@ function loadData() {
   try { var d = localStorage.getItem(STORAGE_KEY); if(d) appData = JSON.parse(d); } catch(e){}
   if (!appData.clients) appData.clients = [];
 }
-// ── Firebase sync helpers ────────────────────────────────────
-var _saveTimer = null;
-
 function saveData() {
-  // Write to localStorage immediately (fast, local cache)
+  // Save to localStorage immediately (fast local cache)
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
-
-  // Debounce Firestore writes (avoid hammering during sync loops)
-  if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(function() {
-    saveToFirestore();
-  }, 800);
+  // Debounce Firestore write
+  if (window._saveTimer) clearTimeout(window._saveTimer);
+  window._saveTimer = setTimeout(saveToFirestore, 800);
 }
 
 function saveToFirestore() {
-  if (!window._db) return; // Firebase not loaded yet
-  var db = window._db;
-  // Strip non-serialisable fields before saving
+  if (!window._db) return;
   var payload = JSON.parse(JSON.stringify(appData));
-  payload.clients.forEach(function(cl) {
-    delete cl._syncStatus; // transient — don't persist
-  });
-  window._setDoc(window._doc(db, 'kotta', 'appdata'), payload)
-    .catch(function(e) { console.warn('[Kotta] Firestore save error:', e); });
-}
-
-function loadData() {
-  // 1. Load from localStorage immediately so the UI is not blank
-  try {
-    var d = localStorage.getItem(STORAGE_KEY);
-    if (d) appData = JSON.parse(d);
-  } catch(e) {}
-  if (!appData.clients) appData.clients = [];
+  payload.clients.forEach(function(cl) { delete cl._syncStatus; });
+  window._setDoc(window._doc(window._db, 'kotta', 'appdata'), payload)
+    .catch(function(e) { console.warn('[Kotta] Firestore write error:', e); });
 }
 
 function startFirebaseSync() {
   if (!window._db) return;
-  var db = window._db;
-  // Real-time listener — fires immediately with current data, then on every change
-  window._onSnapshot(window._doc(db, 'kotta', 'appdata'), function(snap) {
-    if (!snap.exists()) return; // no data yet — first user will create it on first save
-    var remote = snap.data();
-    if (!remote || !remote.clients) return;
+  window._onSnapshot(
+    window._doc(window._db, 'kotta', 'appdata'),
+    function(snap) {
+      if (!snap.exists()) return;
+      var remote = snap.data();
+      if (!remote || !remote.clients) return;
 
-    // Merge: keep local sheet data (large, not in Firestore) but use remote client list
-    var localSheets = {};
-    (appData.clients || []).forEach(function(cl) {
-      if (cl.sheets && Object.keys(cl.sheets).length) localSheets[cl.id] = cl.sheets;
-    });
+      // Preserve local sheet data (too large for Firestore)
+      var localSheets = {};
+      (appData.clients || []).forEach(function(cl) {
+        if (cl.sheets && Object.keys(cl.sheets).length) localSheets[cl.id] = cl.sheets;
+      });
 
-    appData = remote;
-    appData.clients.forEach(function(cl) {
-      if (localSheets[cl.id]) cl.sheets = localSheets[cl.id];
-      if (!cl.sheets) cl.sheets = {};
-    });
+      appData = remote;
+      appData.clients.forEach(function(cl) {
+        if (localSheets[cl.id]) cl.sheets = localSheets[cl.id];
+        if (!cl.sheets) cl.sheets = {};
+      });
 
-    // Update localStorage cache
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
 
-    // Refresh UI
-    buildClientSel();
-    buildMonthSel();
-    if (state.page === 'clientes') renderClientsPage();
-    if (state.page === 'metas')    { renderMetasMonths(); renderMetasContent(); }
-    if (state.page === 'dashboard') renderDashboard();
+      // Refresh UI
+      buildClientSel();
+      buildMonthSel();
+      if (state.page === 'clientes')  renderClientsPage();
+      if (state.page === 'metas')     { renderMetasMonths(); renderMetasContent(); }
+      if (state.page === 'dashboard') renderDashboard();
 
-    console.log('[Kotta] Synced from Firestore — ' + appData.clients.length + ' clientes');
-  }, function(err) {
-    console.warn('[Kotta] Firestore listener error:', err);
-  });
+      console.log('[Kotta] Synced — ' + appData.clients.length + ' clientes');
+    },
+    function(err) { console.warn('[Kotta] Firestore listener error:', err); }
+  );
 }
 
 loadData();
@@ -2099,52 +2098,14 @@ scheduleWeeklySync();
   var _mOv2 = document.getElementById('metaOv');
   if (_mOv2) _mOv2.addEventListener('click', function(e){ if(e.target===e.currentTarget) closeMetaModal(); });
 
-  // Start Firebase real-time sync (starts when Firebase module is ready)
+  // Start Firebase real-time sync
   if (window._fbReady) {
     startFirebaseSync();
   } else {
-    document.addEventListener('firebase-ready', function() {
-      startFirebaseSync();
-    });
+    document.addEventListener('firebase-ready', startFirebaseSync);
   }
 })();
-{
-  function msToNextTue5am() {
-    var now=new Date(), d=now.getDay();
-    var days=(2-d+7)%7;
-    if(days===0&&now.getHours()>=5) days=7;
-    var next=new Date(now); next.setDate(now.getDate()+days); next.setHours(5,0,0,0);
-    return next-now;
-  }
-  function run() { syncAllClients(); setTimeout(run, 7*24*60*60*1000); }
-  var ms=msToNextTue5am();
-  console.log('[Kotta v12] Auto-sync em '+Math.round(ms/3600000)+'h (terça 5h)');
-  setTimeout(run, ms);
-}
-scheduleWeeklySync();
 
-// ════════════════════════════════════════════════════════════════
-// INIT
-// ════════════════════════════════════════════════════════════════
-
-(function init() {
-  if (!appData.clients.length) {
-    state.activeClient = '';
-  } else {
-    state.activeClient = appData.clients[0].id;
-  }
-  buildClientSel();
-  buildMonthSel();
-  setPage('dashboard');
-  if (getClient()) {
-    document.getElementById('topSub').textContent = getClient().name;
-  }
-  // Attach modal overlay listeners
-  var _mOv = document.getElementById('modalOv');
-  if (_mOv) _mOv.addEventListener('click', function(e){ if(e.target===e.currentTarget) closeModal(); });
-  var _mOv2 = document.getElementById('metaOv');
-  if (_mOv2) _mOv2.addEventListener('click', function(e){ if(e.target===e.currentTarget) closeMetaModal(); });
-})();
 </script>
 </body>
 </html>
