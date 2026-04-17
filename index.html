@@ -476,16 +476,24 @@ function startFirebaseSync() {
       var remote = snap.data();
       if (!remote || !remote.clients) return;
 
-      // Preserve local sheet data (too large for Firestore)
-      var localSheets = {};
+      // Preserve local sheet data — keep whichever is fresher (local or remote)
+      var localByClient = {};
       (appData.clients || []).forEach(function(cl) {
-        if (cl.sheets && Object.keys(cl.sheets).length) localSheets[cl.id] = cl.sheets;
+        localByClient[cl.id] = { sheets: cl.sheets || {}, gsLastSync: cl.gsLastSync || 0 };
       });
 
       appData = remote;
       appData.clients.forEach(function(cl) {
-        if (localSheets[cl.id]) cl.sheets = localSheets[cl.id];
-        if (!cl.sheets) cl.sheets = {};
+        var local = localByClient[cl.id];
+        if (!local) { if (!cl.sheets) cl.sheets = {}; return; }
+        // Keep local sheets if they were synced MORE recently than what Firestore has
+        var localNewer = (local.gsLastSync || 0) >= (cl.gsLastSync || 0);
+        if (localNewer && local.sheets && Object.keys(local.sheets).length) {
+          cl.sheets = local.sheets;
+          cl.gsLastSync = local.gsLastSync;
+        } else if (!cl.sheets) {
+          cl.sheets = {};
+        }
       });
 
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
@@ -1460,7 +1468,11 @@ function syncClient(clientId) {
       if (result.found.length > 0) { s2.textContent='✓ '+result.found.length+' aba'+(result.found.length>1?'s':'')+' · agora'; s2.className='cl-status ok'; }
       else { s2.textContent='✕ '+(result.errors.length?result.errors[0].error:'Falha'); s2.className='cl-status err'; }
     }
-    if (prev === clientId) { buildMonthSel(); renderDashboard(); }
+    // Always refresh dashboard and month selector after sync
+    buildMonthSel();
+    if (state.activeClient === clientId || prev === clientId) {
+      renderDashboard();
+    }
   });
 }
 
@@ -1513,7 +1525,11 @@ function syncAllClients() {
             state.activeClient = prev;
             if (btn) btn.disabled = false;
             if (bar) { bar.textContent='✓ '+done+'/'+clients.length+' clientes sincronizados · '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}); setTimeout(()=>{ if(bar) bar.style.display='none'; }, 5000); }
+            // Refresh the full UI so dashboard shows synced data
+            buildClientSel();
+            buildMonthSel();
             renderClientsPage();
+            if (state.page === 'dashboard') renderDashboard();
           }
         };
       }(cl));
@@ -2062,16 +2078,44 @@ function updateCP(cId, mi, n, val) {
 // ════════════════════════════════════════════════════════════════
 
 function scheduleWeeklySync() {
-  function msToNextTue5am() {
-    var now=new Date(), d=now.getDay();
-    var days=(2-d+7)%7;
-    if(days===0&&now.getHours()>=5) days=7;
-    var next=new Date(now); next.setDate(now.getDate()+days); next.setHours(5,0,0,0);
-    return next-now;
+  // Check if we should auto-sync right now (Tuesday and not synced this week)
+  function shouldAutoSync() {
+    var now = new Date();
+    if (now.getDay() !== 2) return false; // only Tuesday
+    // Check if any client was synced in the last 6 days
+    var sixDaysAgo = Date.now() - (6 * 24 * 60 * 60 * 1000);
+    var anyRecentSync = (appData.clients || []).some(function(cl) {
+      return cl.gsSheetId && cl.gsLastSync && cl.gsLastSync > sixDaysAgo;
+    });
+    return !anyRecentSync; // auto-sync only if not synced recently
   }
-  function run() { syncAllClients(); setTimeout(run, 7*24*60*60*1000); }
-  var ms=msToNextTue5am();
-  console.log('[Kotta v12] Auto-sync em '+Math.round(ms/3600000)+'h (terça 5h)');
+
+  function msToNextTue5am() {
+    var now = new Date(), d = now.getDay();
+    var days = (2 - d + 7) % 7;
+    if (days === 0 && now.getHours() >= 5) days = 7;
+    var next = new Date(now);
+    next.setDate(now.getDate() + days);
+    next.setHours(5, 0, 0, 0);
+    return next - now;
+  }
+
+  function run() {
+    console.log('[Kotta] Auto-sync semanal iniciado: ' + new Date().toLocaleString('pt-BR'));
+    syncAllClients();
+    setTimeout(run, 7 * 24 * 60 * 60 * 1000);
+  }
+
+  // On load: if it's Tuesday and not synced this week, sync now
+  if (shouldAutoSync()) {
+    console.log('[Kotta] Terça-feira detectada — iniciando auto-sync...');
+    // Delay 3s to let Firebase load first
+    setTimeout(syncAllClients, 3000);
+  }
+
+  // Schedule next Tuesday
+  var ms = msToNextTue5am();
+  console.log('[Kotta] Próximo auto-sync agendado em ' + Math.round(ms / 3600000) + 'h (terça 5h)');
   setTimeout(run, ms);
 }
 scheduleWeeklySync();
