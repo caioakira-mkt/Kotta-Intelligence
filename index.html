@@ -475,12 +475,12 @@ function saveData() {
 function saveToFirestore() {
   if (!window._db || !_firestoreReady) return;
   var payload = JSON.parse(JSON.stringify(appData));
-  // Strip transient and large fields before writing to Firestore
+  // Strip only transient runtime fields — keep sheets so other users can see data
   payload.clients.forEach(function(cl) {
     delete cl._syncStatus;
-    delete cl.sheets;        // sheets stay local only (too large, re-synced per user)
     delete cl._discoveredSheets;
     delete cl._lastSyncErrors;
+    if (!cl.sheets) cl.sheets = {};
   });
   window._setDoc(window._doc(window._db, 'kotta', 'appdata'), payload)
     .then(function() {
@@ -509,25 +509,35 @@ function startFirebaseSync() {
       var remote = snap.data();
       if (!remote || !remote.clients) return;
 
-      // Merge: remote has client config, local has sheets data (synced per user)
+      // Merge: remote is authoritative for config AND sheets
       var localSheets = {};
       var localSyncTime = {};
       (appData.clients || []).forEach(function(cl) {
-        if (cl.sheets) localSheets[cl.id] = cl.sheets;
+        if (cl.sheets && Object.keys(cl.sheets).length) localSheets[cl.id] = cl.sheets;
         if (cl.gsLastSync) localSyncTime[cl.id] = cl.gsLastSync;
       });
 
-      // Remote is authoritative for client config (name, services, gsSheetId, metas, etc.)
+      // Remote is authoritative for everything
       appData = remote;
 
-      // Restore local sheets (each user syncs their own copy)
+      // For sheets: prefer whichever is more recent (local or remote)
       appData.clients.forEach(function(cl) {
-        cl.sheets = localSheets[cl.id] || {};
-        // Restore gsLastSync from local if more recent
-        if (localSyncTime[cl.id] && localSyncTime[cl.id] > (cl.gsLastSync || 0)) {
-          cl.gsLastSync = localSyncTime[cl.id];
+        var localT = localSyncTime[cl.id] || 0;
+        var remoteT = cl.gsLastSync || 0;
+        var localHasSheets = localSheets[cl.id] && Object.keys(localSheets[cl.id]).length > 0;
+        var remoteHasSheets = cl.sheets && Object.keys(cl.sheets).length > 0;
+
+        if (localHasSheets && localT >= remoteT) {
+          // Local is same age or newer — use local (avoids re-download)
+          cl.sheets = localSheets[cl.id];
+          if (localT > remoteT) cl.gsLastSync = localT;
+        } else if (remoteHasSheets) {
+          // Remote has sheets and is newer — use remote (other user synced it)
+          // keep cl.sheets from remote as-is
+        } else {
+          // Neither has sheets
+          cl.sheets = {};
         }
-        if (!cl.sheets) cl.sheets = {};
       });
 
       // Update localStorage cache
@@ -1554,6 +1564,7 @@ function syncAllClients() {
       var s = document.getElementById('clstat-'+cl.id);
       if (s) { s.textContent='⟳ Sincronizando...'; s.className='cl-status syncing'; }
       state.activeClient = cl.id;
+      // Pass cl directly as clientRef to avoid race condition with state.activeClient
       syncGoogleSheets({id:cl.gsSheetId, published:!!cl.gsPublished}, null, function(cl_ref) {
         return function(result) {
           var cl2 = appData.clients.find(c => c.id === cl_ref.id);
@@ -1570,14 +1581,13 @@ function syncAllClients() {
             state.activeClient = prev;
             if (btn) btn.disabled = false;
             if (bar) { bar.textContent='✓ '+done+'/'+clients.length+' clientes sincronizados · '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}); setTimeout(()=>{ if(bar) bar.style.display='none'; }, 5000); }
-            // Refresh the full UI so dashboard shows synced data
             buildClientSel();
             buildMonthSel();
             renderClientsPage();
             if (state.page === 'dashboard') renderDashboard();
           }
         };
-      }(cl));
+      }(cl), cl);
     }
   }
   pump();
@@ -1820,8 +1830,9 @@ function matchGids(discovered) {
   return gidMap;
 }
 
-function syncGoogleSheets(gsInfo, onProgress, onDone) {
-  var c = getClient();
+function syncGoogleSheets(gsInfo, onProgress, onDone, clientRef) {
+  // clientRef: pass explicit client to support parallel execution
+  var c = clientRef || getClient();
   if (!c) { if(onDone) onDone({found:[],errors:[],discovered:[]}); return; }
   c.sheets = {};
   saveData();
