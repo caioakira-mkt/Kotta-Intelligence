@@ -451,61 +451,106 @@ function loadData() {
   try { var d = localStorage.getItem(STORAGE_KEY); if(d) appData = JSON.parse(d); } catch(e){}
   if (!appData.clients) appData.clients = [];
 }
+// ── Firebase sync — Firestore is single source of truth ──────
+var _firestoreReady = false;  // true after first Firestore read
+var _saveTimer = null;
+var _pendingSave = false;
+
 function saveData() {
-  // Save to localStorage immediately (fast local cache)
+  // Always update localStorage cache immediately
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
-  // Debounce Firestore write
-  if (window._saveTimer) clearTimeout(window._saveTimer);
-  window._saveTimer = setTimeout(saveToFirestore, 800);
+
+  // Only write to Firestore after we have confirmed data from it
+  // (prevents overwriting remote data with stale localStorage on first load)
+  if (!_firestoreReady) {
+    _pendingSave = true; // will write once Firestore data arrives
+    return;
+  }
+
+  // Debounce to avoid hammering during sheet sync loops
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveToFirestore, 400);
 }
 
 function saveToFirestore() {
-  if (!window._db) return;
+  if (!window._db || !_firestoreReady) return;
   var payload = JSON.parse(JSON.stringify(appData));
-  payload.clients.forEach(function(cl) { delete cl._syncStatus; });
+  // Strip transient and large fields before writing to Firestore
+  payload.clients.forEach(function(cl) {
+    delete cl._syncStatus;
+    delete cl.sheets;        // sheets stay local only (too large, re-synced per user)
+    delete cl._discoveredSheets;
+    delete cl._lastSyncErrors;
+  });
   window._setDoc(window._doc(window._db, 'kotta', 'appdata'), payload)
+    .then(function() {
+      console.log('[Kotta] Saved to Firestore — ' + appData.clients.length + ' clientes');
+    })
     .catch(function(e) { console.warn('[Kotta] Firestore write error:', e); });
 }
 
 function startFirebaseSync() {
   if (!window._db) return;
+
   window._onSnapshot(
     window._doc(window._db, 'kotta', 'appdata'),
     function(snap) {
-      if (!snap.exists()) return;
+      var isFirstRead = !_firestoreReady;
+      _firestoreReady = true;
+
+      if (!snap.exists()) {
+        // No data in Firestore yet — this is the first user ever
+        // Write current appData to initialize Firestore
+        console.log('[Kotta] Firestore vazio — inicializando com dados locais');
+        saveToFirestore();
+        return;
+      }
+
       var remote = snap.data();
       if (!remote || !remote.clients) return;
 
-      // Preserve local sheet data — keep whichever is fresher (local or remote)
-      var localByClient = {};
+      // Merge: remote has client config, local has sheets data (synced per user)
+      var localSheets = {};
+      var localSyncTime = {};
       (appData.clients || []).forEach(function(cl) {
-        localByClient[cl.id] = { sheets: cl.sheets || {}, gsLastSync: cl.gsLastSync || 0 };
+        if (cl.sheets) localSheets[cl.id] = cl.sheets;
+        if (cl.gsLastSync) localSyncTime[cl.id] = cl.gsLastSync;
       });
 
+      // Remote is authoritative for client config (name, services, gsSheetId, metas, etc.)
       appData = remote;
+
+      // Restore local sheets (each user syncs their own copy)
       appData.clients.forEach(function(cl) {
-        var local = localByClient[cl.id];
-        if (!local) { if (!cl.sheets) cl.sheets = {}; return; }
-        // Keep local sheets if they were synced MORE recently than what Firestore has
-        var localNewer = (local.gsLastSync || 0) >= (cl.gsLastSync || 0);
-        if (localNewer && local.sheets && Object.keys(local.sheets).length) {
-          cl.sheets = local.sheets;
-          cl.gsLastSync = local.gsLastSync;
-        } else if (!cl.sheets) {
-          cl.sheets = {};
+        cl.sheets = localSheets[cl.id] || {};
+        // Restore gsLastSync from local if more recent
+        if (localSyncTime[cl.id] && localSyncTime[cl.id] > (cl.gsLastSync || 0)) {
+          cl.gsLastSync = localSyncTime[cl.id];
         }
+        if (!cl.sheets) cl.sheets = {};
       });
 
+      // Update localStorage cache
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
 
-      // Refresh UI
+      // If there was a pending save (from before Firestore was ready), write now
+      if (isFirstRead && _pendingSave) {
+        _pendingSave = false;
+        setTimeout(saveToFirestore, 200);
+      }
+
+      // Refresh UI with remote data
+      var prevActive = state.activeClient;
+      if (appData.clients.length && !appData.clients.find(function(c){ return c.id === state.activeClient; })) {
+        state.activeClient = appData.clients[0].id;
+      }
       buildClientSel();
       buildMonthSel();
       if (state.page === 'clientes')  renderClientsPage();
       if (state.page === 'metas')     { renderMetasMonths(); renderMetasContent(); }
       if (state.page === 'dashboard') renderDashboard();
 
-      console.log('[Kotta] Synced — ' + appData.clients.length + ' clientes');
+      console.log('[Kotta] Firestore sync — ' + appData.clients.length + ' clientes' + (isFirstRead ? ' (primeira leitura)' : ''));
     },
     function(err) { console.warn('[Kotta] Firestore listener error:', err); }
   );
