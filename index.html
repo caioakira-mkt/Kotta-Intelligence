@@ -1585,7 +1585,15 @@ function syncClient(clientId) {
   syncGoogleSheets({id:cl.gsSheetId, published:!!cl.gsPublished}, null, function(result) {
     state.activeClient = prev;
     var cl2 = appData.clients.find(c => c.id === clientId);
-    if (cl2) { cl2.gsLastSync = Date.now(); cl2._syncStatus = null; }
+    if (cl2) {
+      cl2.gsLastSync = Date.now();
+      cl2._syncStatus = null;
+      // Ensure sheets from sync are in the current appData reference
+      var syncedCl = appData.clients.find(function(x){ return x.id === clientId; });
+      if (syncedCl && cl && cl.sheets && Object.keys(cl.sheets).length > 0) {
+        syncedCl.sheets = cl.sheets;
+      }
+    }
     saveData();
     var s2 = document.getElementById('clstat-'+clientId);
     if (s2) {
@@ -1636,8 +1644,17 @@ function syncAllClients() {
       // Pass cl directly as clientRef to avoid race condition with state.activeClient
       syncGoogleSheets({id:cl.gsSheetId, published:!!cl.gsPublished}, null, function(cl_ref) {
         return function(result) {
+          // Find the CURRENT reference in appData (may have been replaced by onSnapshot)
           var cl2 = appData.clients.find(c => c.id === cl_ref.id);
-          if (cl2) { cl2.gsLastSync = Date.now(); cl2._syncStatus = null; }
+          if (cl2) {
+            cl2.gsLastSync = Date.now();
+            cl2._syncStatus = null;
+            // Copy sheets from cl_ref into the current appData reference
+            // (Firebase onSnapshot may have replaced appData mid-sync)
+            if (cl_ref.sheets && Object.keys(cl_ref.sheets).length > 0) {
+              cl2.sheets = cl_ref.sheets;
+            }
+          }
           saveData(); done++; active--;
           var s2 = document.getElementById('clstat-'+cl_ref.id);
           if (s2) {
@@ -1942,6 +1959,13 @@ function syncGoogleSheets(gsInfo, onProgress, onDone, clientRef) {
           if(queue.length) pump();
           else if(active===0){
             c._lastSyncErrors=errors;
+            // Re-find client in current appData in case onSnapshot replaced it mid-sync
+            var currentClient = appData.clients.find(function(x){ return x.id === c.id; });
+            if (currentClient && currentClient !== c) {
+              // Copy sheets from our sync target into the current appData reference
+              currentClient.sheets = c.sheets;
+              currentClient._lastSyncErrors = errors;
+            }
             saveData();
             if(onDone) onDone({found,errors,discovered});
           }
