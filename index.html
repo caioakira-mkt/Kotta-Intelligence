@@ -476,16 +476,57 @@ function saveData() {
   _saveTimer = setTimeout(saveToFirestore, 300);
 }
 
-function saveToFirestore() {
-  if (!window._db || !_firestoreReady) return;
-  var payload = JSON.parse(JSON.stringify(appData));
-  // Remove transient runtime fields before writing
+function serializeForFirestore(data) {
+  // Firestore does not support nested arrays (sheets grids are array of arrays).
+  // Solution: serialize each sheet grid to a JSON string before writing.
+  var payload = JSON.parse(JSON.stringify(data));
   payload.clients.forEach(function(cl) {
     delete cl._syncStatus;
     delete cl._discoveredSheets;
     delete cl._lastSyncErrors;
-    if (!cl.sheets) cl.sheets = {};
+    // Convert sheets grid arrays to JSON strings
+    if (cl.sheets && typeof cl.sheets === 'object') {
+      var serialized = {};
+      Object.keys(cl.sheets).forEach(function(sheetName) {
+        var grid = cl.sheets[sheetName];
+        // grid is array of arrays — serialize to string
+        serialized[sheetName] = JSON.stringify(grid);
+      });
+      cl.sheets = serialized;
+    } else {
+      cl.sheets = {};
+    }
   });
+  return payload;
+}
+
+function deserializeFromFirestore(data) {
+  // Convert sheet JSON strings back to grid arrays after reading from Firestore
+  if (!data || !data.clients) return data;
+  data.clients.forEach(function(cl) {
+    if (cl.sheets && typeof cl.sheets === 'object') {
+      var deserialized = {};
+      Object.keys(cl.sheets).forEach(function(sheetName) {
+        var val = cl.sheets[sheetName];
+        if (typeof val === 'string') {
+          try { deserialized[sheetName] = JSON.parse(val); }
+          catch(e) { deserialized[sheetName] = val; }
+        } else {
+          // Already an array (old format) — keep as-is
+          deserialized[sheetName] = val;
+        }
+      });
+      cl.sheets = deserialized;
+    } else {
+      cl.sheets = {};
+    }
+  });
+  return data;
+}
+
+function saveToFirestore() {
+  if (!window._db || !_firestoreReady) return;
+  var payload = serializeForFirestore(appData);
   window._setDoc(window._doc(window._db, 'kotta', 'appdata'), payload)
     .then(function() {
       console.log('[Kotta] Firestore write OK — ' + appData.clients.length + ' clientes');
@@ -511,7 +552,7 @@ function startFirebaseSync() {
         return;
       }
 
-      var remote = snap.data();
+      var remote = deserializeFromFirestore(snap.data());
       if (!remote || !remote.clients) return;
 
       // On first read: apply any queued local writes on top of remote
