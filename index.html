@@ -451,31 +451,35 @@ function loadData() {
   try { var d = localStorage.getItem(STORAGE_KEY); if(d) appData = JSON.parse(d); } catch(e){}
   if (!appData.clients) appData.clients = [];
 }
-// ── Firebase sync — Firestore is single source of truth ──────
-var _firestoreReady = false;  // true after first Firestore read
+// ── Firebase sync ────────────────────────────────────────────
+// Architecture: Firestore is the ONLY database.
+// localStorage = display cache only (never written back to Firestore on load)
+// Every user action writes directly to Firestore.
+// onSnapshot keeps all users in sync in real-time.
+
+var _firestoreReady = false;
+var _writeQueue = [];   // writes queued before Firestore connects
 var _saveTimer = null;
-var _pendingLocalData = null; // local appData snapshot saved before Firestore was ready
 
 function saveData() {
-  // Always update localStorage cache immediately
+  // Always update local cache for fast re-render
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
 
   if (!_firestoreReady) {
-    // Not yet connected to Firestore — save a snapshot of local state
-    // so we can merge it into Firestore data when it arrives
-    _pendingLocalData = JSON.parse(JSON.stringify(appData));
+    // Queue: snapshot the full appData so we can write it once ready
+    _writeQueue.push(JSON.parse(JSON.stringify(appData)));
     return;
   }
 
-  // Debounce to avoid hammering during sheet sync loops
+  // Debounce: avoid rapid writes during sheet sync loops
   if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(saveToFirestore, 400);
+  _saveTimer = setTimeout(saveToFirestore, 300);
 }
 
 function saveToFirestore() {
   if (!window._db || !_firestoreReady) return;
   var payload = JSON.parse(JSON.stringify(appData));
-  // Strip only transient runtime fields — keep sheets so other users can see data
+  // Remove transient runtime fields before writing
   payload.clients.forEach(function(cl) {
     delete cl._syncStatus;
     delete cl._discoveredSheets;
@@ -484,9 +488,11 @@ function saveToFirestore() {
   });
   window._setDoc(window._doc(window._db, 'kotta', 'appdata'), payload)
     .then(function() {
-      console.log('[Kotta] Saved to Firestore — ' + appData.clients.length + ' clientes');
+      console.log('[Kotta] Firestore write OK — ' + appData.clients.length + ' clientes');
     })
-    .catch(function(e) { console.warn('[Kotta] Firestore write error:', e); });
+    .catch(function(e) {
+      console.warn('[Kotta] Firestore write error:', e);
+    });
 }
 
 function startFirebaseSync() {
@@ -499,9 +505,8 @@ function startFirebaseSync() {
       _firestoreReady = true;
 
       if (!snap.exists()) {
-        // No data in Firestore yet — this is the first user ever
-        // Write current appData to initialize Firestore
-        console.log('[Kotta] Firestore vazio — inicializando com dados locais');
+        // Firestore empty — first ever user, write local data to initialize
+        console.log('[Kotta] Firestore vazio — inicializando...');
         saveToFirestore();
         return;
       }
@@ -509,75 +514,70 @@ function startFirebaseSync() {
       var remote = snap.data();
       if (!remote || !remote.clients) return;
 
-      // Merge: remote is authoritative for config AND sheets
-      var localSheets = {};
-      var localSyncTime = {};
-      (appData.clients || []).forEach(function(cl) {
-        if (cl.sheets && Object.keys(cl.sheets).length) localSheets[cl.id] = cl.sheets;
-        if (cl.gsLastSync) localSyncTime[cl.id] = cl.gsLastSync;
-      });
+      // On first read: apply any queued local writes on top of remote
+      if (isFirstRead && _writeQueue.length > 0) {
+        var latest = _writeQueue[_writeQueue.length - 1]; // most recent local state
+        _writeQueue = [];
 
-      // Remote is authoritative for everything
-      appData = remote;
-
-      // For sheets: prefer whichever is more recent (local or remote)
-      appData.clients.forEach(function(cl) {
-        var localT = localSyncTime[cl.id] || 0;
-        var remoteT = cl.gsLastSync || 0;
-        var localHasSheets = localSheets[cl.id] && Object.keys(localSheets[cl.id]).length > 0;
-        var remoteHasSheets = cl.sheets && Object.keys(cl.sheets).length > 0;
-
-        if (localHasSheets && localT >= remoteT) {
-          // Local is same age or newer — use local (avoids re-download)
-          cl.sheets = localSheets[cl.id];
-          if (localT > remoteT) cl.gsLastSync = localT;
-        } else if (remoteHasSheets) {
-          // Remote has sheets and is newer — use remote (other user synced it)
-          // keep cl.sheets from remote as-is
-        } else {
-          // Neither has sheets
-          cl.sheets = {};
-        }
-      });
-
-      // Update localStorage cache
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
-
-      // On first read: merge any local changes made before Firestore connected
-      if (isFirstRead && _pendingLocalData) {
-        var pending = _pendingLocalData;
-        _pendingLocalData = null;
-
-        // Add any clients that exist locally but not in remote (user added while loading)
-        (pending.clients || []).forEach(function(localCl) {
-          var existsInRemote = appData.clients.find(function(rc) { return rc.id === localCl.id; });
-          if (!existsInRemote) {
-            // New client added locally — add to merged data
-            appData.clients.push(localCl);
-            console.log('[Kotta] Merged new local client into Firestore: ' + localCl.name);
+        // Merge: take remote as base, apply local additions
+        // New clients in local but not in remote → add them
+        (latest.clients || []).forEach(function(localCl) {
+          var inRemote = remote.clients.find(function(rc) { return rc.id === localCl.id; });
+          if (!inRemote) {
+            remote.clients.push(localCl);
+            console.log('[Kotta] Novo cliente adicionado ao Firestore: ' + localCl.name);
           } else {
-            // Client exists in both — apply local changes (gsSheetId, metas, etc.)
-            // Local wins for fields the user just edited
-            if (localCl.gsSheetId && !existsInRemote.gsSheetId) {
-              existsInRemote.gsSheetId = localCl.gsSheetId;
-              existsInRemote.gsPublished = localCl.gsPublished;
+            // Apply any local field updates (gsSheetId, metas, sheets)
+            if (localCl.gsSheetId) {
+              inRemote.gsSheetId  = localCl.gsSheetId;
+              inRemote.gsPublished = localCl.gsPublished;
             }
-            if (localCl.gsSheetId && localCl.gsLastSync && localCl.gsLastSync > (existsInRemote.gsLastSync || 0)) {
-              existsInRemote.gsSheetId = localCl.gsSheetId;
-              existsInRemote.gsPublished = localCl.gsPublished;
-              existsInRemote.gsLastSync = localCl.gsLastSync;
-              existsInRemote.sheets = localCl.sheets || existsInRemote.sheets || {};
+            if (localCl.gsLastSync && localCl.gsLastSync > (inRemote.gsLastSync || 0)) {
+              inRemote.gsLastSync = localCl.gsLastSync;
+              if (localCl.sheets && Object.keys(localCl.sheets).length) {
+                inRemote.sheets = localCl.sheets;
+              }
+            }
+            if (localCl.metas && localCl.metas.length) {
+              inRemote.metas = localCl.metas;
             }
           }
         });
 
-        // Save the merged result to Firestore immediately
-        setTimeout(saveToFirestore, 100);
+        // Write merged result to Firestore
+        appData = remote;
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
+        saveToFirestore();
+      } else {
+        // Subsequent reads: Firestore is authoritative
+        // Keep local sheets only if they are fresher than what's in Firestore
+        var localSheetsByClient = {};
+        var localSyncTimeByClient = {};
+        (appData.clients || []).forEach(function(cl) {
+          if (cl.sheets && Object.keys(cl.sheets).length > 0) {
+            localSheetsByClient[cl.id] = cl.sheets;
+          }
+          if (cl.gsLastSync) localSyncTimeByClient[cl.id] = cl.gsLastSync;
+        });
+
+        appData = remote;
+        appData.clients.forEach(function(cl) {
+          var localT  = localSyncTimeByClient[cl.id] || 0;
+          var remoteT = cl.gsLastSync || 0;
+          if (localT > remoteT && localSheetsByClient[cl.id]) {
+            // Local sync is more recent — keep local sheets
+            cl.sheets    = localSheetsByClient[cl.id];
+            cl.gsLastSync = localT;
+          } else if (!cl.sheets) {
+            cl.sheets = {};
+          }
+        });
+
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
       }
 
-      // Refresh UI with remote data
-      var prevActive = state.activeClient;
-      if (appData.clients.length && !appData.clients.find(function(c){ return c.id === state.activeClient; })) {
+      // Refresh the entire UI
+      if (appData.clients.length && !appData.clients.find(function(c) { return c.id === state.activeClient; })) {
         state.activeClient = appData.clients[0].id;
       }
       buildClientSel();
@@ -586,9 +586,11 @@ function startFirebaseSync() {
       if (state.page === 'metas')     { renderMetasMonths(); renderMetasContent(); }
       if (state.page === 'dashboard') renderDashboard();
 
-      console.log('[Kotta] Firestore sync — ' + appData.clients.length + ' clientes' + (isFirstRead ? ' (primeira leitura)' : ''));
+      console.log('[Kotta] onSnapshot — ' + appData.clients.length + ' clientes' + (isFirstRead ? ' (1ª leitura)' : ''));
     },
-    function(err) { console.warn('[Kotta] Firestore listener error:', err); }
+    function(err) {
+      console.warn('[Kotta] Firestore listener error:', err);
+    }
   );
 }
 
