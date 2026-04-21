@@ -454,16 +454,16 @@ function loadData() {
 // ── Firebase sync — Firestore is single source of truth ──────
 var _firestoreReady = false;  // true after first Firestore read
 var _saveTimer = null;
-var _pendingSave = false;
+var _pendingLocalData = null; // local appData snapshot saved before Firestore was ready
 
 function saveData() {
   // Always update localStorage cache immediately
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
 
-  // Only write to Firestore after we have confirmed data from it
-  // (prevents overwriting remote data with stale localStorage on first load)
   if (!_firestoreReady) {
-    _pendingSave = true; // will write once Firestore data arrives
+    // Not yet connected to Firestore — save a snapshot of local state
+    // so we can merge it into Firestore data when it arrives
+    _pendingLocalData = JSON.parse(JSON.stringify(appData));
     return;
   }
 
@@ -543,10 +543,36 @@ function startFirebaseSync() {
       // Update localStorage cache
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch(e) {}
 
-      // If there was a pending save (from before Firestore was ready), write now
-      if (isFirstRead && _pendingSave) {
-        _pendingSave = false;
-        setTimeout(saveToFirestore, 200);
+      // On first read: merge any local changes made before Firestore connected
+      if (isFirstRead && _pendingLocalData) {
+        var pending = _pendingLocalData;
+        _pendingLocalData = null;
+
+        // Add any clients that exist locally but not in remote (user added while loading)
+        (pending.clients || []).forEach(function(localCl) {
+          var existsInRemote = appData.clients.find(function(rc) { return rc.id === localCl.id; });
+          if (!existsInRemote) {
+            // New client added locally — add to merged data
+            appData.clients.push(localCl);
+            console.log('[Kotta] Merged new local client into Firestore: ' + localCl.name);
+          } else {
+            // Client exists in both — apply local changes (gsSheetId, metas, etc.)
+            // Local wins for fields the user just edited
+            if (localCl.gsSheetId && !existsInRemote.gsSheetId) {
+              existsInRemote.gsSheetId = localCl.gsSheetId;
+              existsInRemote.gsPublished = localCl.gsPublished;
+            }
+            if (localCl.gsSheetId && localCl.gsLastSync && localCl.gsLastSync > (existsInRemote.gsLastSync || 0)) {
+              existsInRemote.gsSheetId = localCl.gsSheetId;
+              existsInRemote.gsPublished = localCl.gsPublished;
+              existsInRemote.gsLastSync = localCl.gsLastSync;
+              existsInRemote.sheets = localCl.sheets || existsInRemote.sheets || {};
+            }
+          }
+        });
+
+        // Save the merged result to Firestore immediately
+        setTimeout(saveToFirestore, 100);
       }
 
       // Refresh UI with remote data
