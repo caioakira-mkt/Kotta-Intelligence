@@ -1647,13 +1647,14 @@ function syncAllClients() {
           if (bar) bar.textContent='⟳ '+done+'/'+clients.length+' sincronizados...';
           if (queue.length) pump();
           else if (active === 0) {
-            state.activeClient = prev;
             if (btn) btn.disabled = false;
             if (bar) { bar.textContent='✓ '+done+'/'+clients.length+' clientes sincronizados · '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}); setTimeout(()=>{ if(bar) bar.style.display='none'; }, 5000); }
+            // Restore active client to the one that was selected before sync
+            state.activeClient = prev;
             buildClientSel();
             buildMonthSel();
             renderClientsPage();
-            if (state.page === 'dashboard') renderDashboard();
+            renderDashboard(); // always refresh — data changed for all clients
           }
         };
       }(cl), cl);
