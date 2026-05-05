@@ -794,10 +794,12 @@ function getMensalGrid(client) {
 
 function detectClientType(headers) {
   // headers = array of lowercase header strings
-  var hasCarrinhos = headers.some(h => h && (h.indexOf('carrinho') >= 0 || h.indexOf('compras') >= 0 || h.indexOf('custo p/ compra') >= 0));
-  var hasConversas = headers.some(h => h && (h.indexOf('conversas iniciadas') >= 0 || h.indexOf('custo p/ conversa') >= 0));
-  if (hasConversas) return 'whatsapp';
-  if (hasCarrinhos) return 'cardapio';
+  var hasCarrinhos  = headers.some(function(h){ return h && (h.indexOf('carrinho') >= 0 || h.indexOf('compras') >= 0 || h.indexOf('custo p/ compra') >= 0); });
+  var hasConversas  = headers.some(function(h){ return h && (h.indexOf('conversas iniciadas') >= 0 || h.indexOf('custo p/ conversa') >= 0); });
+  var hasAgendamento = headers.some(function(h){ return h && (h.indexOf('agendamento') >= 0 || h.indexOf('visualizações pg') >= 0 || h.indexOf('visualizacoes pg') >= 0); });
+  if (hasConversas)   return 'whatsapp';
+  if (hasCarrinhos)   return 'cardapio';
+  if (hasAgendamento) return 'landing';
   return 'unknown';
 }
 
@@ -879,7 +881,14 @@ function normalizeNum(sv) {
     else sv = sv.replace(/,/g, '');
   } else if (sv.indexOf('.') >= 0) {
     var dp = sv.split('.');
-    if (dp.length === 2 && dp[1].length === 3) sv = sv.replace(/\./g, ''); // thousands
+    if (dp.length > 2) {
+      // Multiple dots = all are thousands separators (e.g. 1.234.567)
+      sv = sv.replace(/\./g, '');
+    } else if (dp.length === 2 && dp[1].length === 3) {
+      // Single dot with exactly 3 decimal digits = thousands separator
+      sv = sv.replace(/\./g, '');
+    }
+    // Single dot with 1-2 decimal digits = decimal point (leave as-is)
   }
   var n = parseFloat(sv);
   if (isPct && !isNaN(n)) n = n / 100;
@@ -1053,14 +1062,57 @@ function renderGeralSlide(cur, prev, records, month) {
 // ── SLIDE: Meta Ads ───────────────────────────────────────────
 function renderMetaAdsSlide(cur, prev, records, month, clientType) {
   var html = '<div class="slide">';
-  var isWpp = clientType === 'whatsapp';
+  var isWpp     = clientType === 'whatsapp';
+  var isLanding = clientType === 'landing';
 
   html += '<div class="slide-header"><div class="slide-title">MÉTRICAS <span class="blue">META ADS</span></div><div class="slide-month">' + month.toUpperCase() + '</div></div>';
 
   var inv = getVal(cur, 'investimento em ads', 'investimento');
   var pInv = prev ? getVal(prev, 'investimento em ads', 'investimento') : null;
 
-  if (isWpp) {
+  if (isLanding) {
+    // Landing Page / Agendamento metrics (Ticino type)
+    var agend    = getVal(cur, 'agendamentos');
+    var cpAgend  = getVal(cur, 'custo por agendamento', 'custo p/ agendamento');
+    var ctr      = getVal(cur, 'ctr');
+    var pAgend   = prev ? getVal(prev, 'agendamentos') : null;
+    var pCpAgend = prev ? getVal(prev, 'custo por agendamento', 'custo p/ agendamento') : null;
+
+    html += '<div class="kpi-row cols-4">';
+    html += kpiCard('VALOR USADO', fmtR$(inv), inv, pInv, 'dark-card');
+    html += kpiCard('AGENDAMENTOS', agend !== null ? fmtBR(agend, 0) : '—', agend, pAgend, 'dark-card');
+    html += kpiCard('CUSTO P/ AGENDAMENTO', fmtR$(cpAgend), cpAgend, pCpAgend, 'dark-card', null, true);
+    html += kpiCard('CTR', fmtPct(ctr), ctr, prev ? getVal(prev, 'ctr') : null, 'mid-card');
+    html += '</div>';
+
+    // Funnel: Cliques → Visitas IG → Visualizações PG → Agendamentos
+    var cliques   = getVal(cur, 'cliques no link');
+    var visitasIG = getVal(cur, 'visitas ig');
+    var vizPG     = getVal(cur, 'visualizações pg', 'visualizacoes pg');
+    var agendF    = getVal(cur, 'agendamentos');
+    html += renderFunnelBars('landing', [
+      {label:'Cliques no Link', val:cliques,   color:'#1877F2'},
+      {label:'Visitas IG',      val:visitasIG, color:'#1877F2'},
+      {label:'Visualizações PG', val:vizPG,   color:'#1877F2'},
+      {label:'Agendamentos',    val:agendF,    color:'#1877F2'},
+    ]);
+
+    // Chart
+    html += '<div class="chart-section" style="margin-top:16px">';
+    html += '<div class="chart-controls">';
+    html += '<div class="chart-title">Evolução Meta Ads</div>';
+    html += buildMetricToggles('meta_landing', [
+      {key:'investimento em ads', label:'Investimento',      color:'#1877F2'},
+      {key:'agendamentos',        label:'Agendamentos',      color:'#25D366'},
+      {key:'visitas ig',          label:'Visitas IG',        color:'#F5C842'},
+      {key:'visualizações pg',    label:'Visualizações PG',  color:'#9333ea'},
+      {key:'ctr',                 label:'CTR',               color:'#FF3B1F'},
+    ], records);
+    html += '</div>';
+    html += '<canvas id="chart_meta_landing" height="160"></canvas>';
+    html += '</div>';
+
+  } else if (isWpp) {
     // WhatsApp metrics
     var convInit = getVal(cur, 'conversas iniciadas');
     var cpci = getVal(cur, 'custo p/ conversa', 'cpci');
@@ -1379,6 +1431,13 @@ function renderAllCharts() {
 }
 
 var CHART_METRIC_DEFS = {
+  meta_landing: [
+    {key:'investimento em ads', label:'Investimento',     color:'#1877F2'},
+    {key:'agendamentos',        label:'Agendamentos',     color:'#25D366'},
+    {key:'visitas ig',          label:'Visitas IG',       color:'#F5C842'},
+    {key:'visualizações pg',    label:'Visualizações PG', color:'#9333ea'},
+    {key:'ctr',                 label:'CTR',              color:'#FF3B1F'},
+  ],
   geral: [
     {key:'faturamento', label:'Faturamento', color:'#FF3B1F'},
     {key:'pedidos', label:'Pedidos', color:'#1877F2'},
